@@ -163,6 +163,12 @@ def fetch_github_last_commit(org, repo, branch)
   }
 end
 
+def fetch_github_default_branch(org, repo)
+  url = "https://api.github.com/repos/#{org}/#{repo}"
+  _code, data = github_api_get(url)
+  data["default_branch"]
+end
+
 def fetch_github_codeowners(org, repo, branch)
   urls = [
     "https://api.github.com/repos/#{org}/#{repo}/contents/.github/CODEOWNERS?ref=#{branch}",
@@ -497,7 +503,9 @@ if __FILE__ == $0
     bb_tags = bitbucket_tags(project, repo)
     gh_tags = fetch_github_items("tags", gh_org, gh_repo)
     bb_default_branch = bitbucket_default_branch(project, repo)
-    gh_branch = gh_branches.map { |b| b['name'] }.include?(bb_default_branch) ? bb_default_branch : (gh_branches.map { |b| b['name'] }.include?('main') ? 'main' : gh_branches[0]['name'])
+    gh_default_branch = fetch_github_default_branch(gh_org, gh_repo)
+    # Use the correct default branch for GitHub queries below
+    gh_branch = gh_branches.map { |b| b['name'] }.include?(bb_default_branch) ? bb_default_branch : (gh_branches.map { |b| b['name'] }.include?(gh_default_branch) ? gh_default_branch : gh_branches[0]['name'])
     bb_commit_count = bitbucket_commit_count(project, repo, bb_default_branch)
     gh_commit_count = fetch_github_commits_count(gh_org, gh_repo, gh_branch)
     bb_open_prs = bitbucket_prs(project, repo, 'OPEN').size
@@ -560,6 +568,7 @@ if __FILE__ == $0
 
   print_heading("Repository Validation")
   results = [
+    { metric: "Default Branch Name", bb: bb_default_branch, gh: gh_default_branch, status: bb_default_branch == gh_default_branch ? "Validation Success" : "Validation Failed" },
     { metric: "Total Branch", bb: bb_branches.size, gh: gh_branches.size, status: bb_branches.size == gh_branches.size ? "Validation Success" : "Validation Failed" },
     { metric: "Total Tags", bb: bb_tags.size, gh: gh_tags.size, status: bb_tags.size == gh_tags.size ? "Validation Success" : "Validation Failed" },
     { metric: "Total commit in default branch", bb: bb_commit_count, gh: gh_commit_count, status: bb_commit_count == gh_commit_count ? "Validation Success" : "Validation Failed" },
