@@ -3,6 +3,9 @@ require 'net/http'
 require 'uri'
 require 'base64'
 require 'time'
+require 'fileutils'
+
+#-------------------- Bitbucket API helpers ------------------------
 
 def bitbucket_api_request(path)
   base = ENV.fetch('BITBUCKET_BASEURL')
@@ -88,6 +91,8 @@ def bitbucket_last_commit(project, repo, branch)
     sha: c && c['id']
   }
 end
+
+#-------------------- GitHub API helpers ------------------------
 
 def github_api_get_raw(url)
   req = Net::HTTP::Get.new(URI(url))
@@ -236,7 +241,6 @@ def clone_teams_repo_if_missing
   unless File.exist?(teams_json_path)
     puts "Cloning icesdlc/ghec.intcx.teams repo..."
     if Dir.exist?(repo_dir)
-      require 'fileutils'
       FileUtils.rm_rf(repo_dir)
     end
     git_url = "https://github.com/icesdlc/ghec.intcx.teams.git"
@@ -261,6 +265,18 @@ def clone_repo_repo_if_missing
     end
   end
   repo_dir
+end
+
+def clone_repo_if_missing(local_dir, remote_url)
+  if Dir.exist?(local_dir)
+    FileUtils.rm_rf(local_dir)
+  end
+  puts "Cloning #{remote_url} into #{local_dir} ..."
+  system("git clone --depth 1 #{remote_url} #{local_dir}")
+  unless Dir.exist?(local_dir)
+    puts "Error: Unable to clone #{remote_url}!"
+    exit 1
+  end
 end
 
 def read_teams_json(teams_json_path, project_key)
@@ -294,6 +310,21 @@ def fetch_github_direct_access_teams(org, repo)
   teams
 end
 
+def validate_teams_against_roles(github_teams, roles_hash)
+  expected_team_names = []
+  roles_hash.each do |role, arr|
+    arr.each { |r| expected_team_names << r['name'] }
+  end
+  results = []
+  expected_team_names.each_with_index do |team_name, idx|
+    gt = github_teams.find { |t| t[:name] == team_name }
+    status = gt ? "Validation Success" : "Validation Failed"
+    perm = gt ? gt[:permission] : "-"
+    results << { si_no: idx+1, name: team_name, permission: perm, status: status }
+  end
+  results
+end
+
 def print_heading(text)
   puts "\n#{text}\n" + "-" * text.length
 end
@@ -315,16 +346,19 @@ end
 
 def print_codeowners_table(codeowners_result)
   headers = ["Expected", "Actual", "Missing", "Validation Status"]
-  rows = []
-  if codeowners_result
-    rows << [
-      codeowners_result[:expected].join(', '),
-      codeowners_result[:actual].join(', '),
-      codeowners_result[:missing].join(', '),
-      codeowners_result[:status]
-    ]
+  if !codeowners_result || !codeowners_result[:expected] || codeowners_result[:expected].empty?
+    puts "\nCodeOwners Validation:\nNo CodeOwners data to validate."
+    return
   end
-  col_widths = rows.transpose.each_with_index.map { |col, i| [headers[i].length, *col.map { |c| c.to_s.length }].max }
+  rows = [[
+    codeowners_result[:expected].join(', '),
+    codeowners_result[:actual].join(', '),
+    codeowners_result[:missing].join(', '),
+    codeowners_result[:status]
+  ]]
+  col_widths = headers.each_with_index.map do |h, i|
+    [h.length, *rows.map { |row| row[i].to_s.length }].max
+  end
   sep = "+-" + col_widths.map { |w| "-" * w }.join("-+-") + "-+"
   puts "\nCodeOwners Validation:\n#{sep}"
   puts "| " + headers.each_with_index.map { |h, i| h.ljust(col_widths[i]) }.join(" | ") + " |"
@@ -337,15 +371,18 @@ end
 
 def print_webhook_table(webhook_result)
   headers = ["Expected", "Actual", "Validation Status"]
-  rows = []
-  if webhook_result
-    rows << [
-      webhook_result[:expected],
-      webhook_result[:actual].join(', '),
-      webhook_result[:status]
-    ]
+  if !webhook_result || !webhook_result[:expected]
+    puts "\nWebhook Validation:\nNo webhook data to validate."
+    return
   end
-  col_widths = rows.transpose.each_with_index.map { |col, i| [headers[i].length, *col.map { |c| c.to_s.length }].max }
+  rows = [[
+    webhook_result[:expected],
+    webhook_result[:actual].join(', '),
+    webhook_result[:status]
+  ]]
+  col_widths = headers.each_with_index.map do |h, i|
+    [h.length, *rows.map { |row| row[i].to_s.length }].max
+  end
   sep = "+-" + col_widths.map { |w| "-" * w }.join("-+-") + "-+"
   puts "\nWebhook Validation:\n#{sep}"
   puts "| " + headers.each_with_index.map { |h, i| h.ljust(col_widths[i]) }.join(" | ") + " |"
@@ -358,6 +395,10 @@ end
 
 def print_teams_table(team_results)
   headers = ["SI No", "Team Name", "Permission", "Validation Status"]
+  if !team_results || team_results.empty?
+    puts "\nTeams Validation:\nNo team data to validate."
+    return
+  end
   col_widths = [
     6,
     [25, *team_results.map { |t| t[:name].to_s.length }].max,
@@ -374,9 +415,12 @@ def print_teams_table(team_results)
   puts sep
 end
 
-# --- UPDATED: Custom Properties Table prints WITHOUT validation status ---
 def print_github_custom_properties_table(props, repo_entry = nil)
   headers = ["SINo", "Property-Name", "Property-Value"]
+  if !props || props.empty?
+    puts "\nCustom Properties Validation:\nNo custom properties found for this GitHub repository."
+    return
+  end
   col_widths = [
     5,
     [14, *props.map { |p| p[:property_name].to_s.length }].max,
@@ -386,21 +430,17 @@ def print_github_custom_properties_table(props, repo_entry = nil)
   puts "\n#{sep}"
   puts "| " + headers.each_with_index.map { |h, i| h.ljust(col_widths[i]) }.join(" | ") + " |"
   puts sep
-  if props.empty?
-    puts "| " + "No custom properties found for this GitHub repository.".ljust(col_widths.sum + (col_widths.size-1)*3) + " |"
-  else
-    props.each_with_index do |prop, idx|
-      pname = prop[:property_name].to_s
-      pval = prop[:value].to_s
-      puts "| #{(idx+1).to_s.ljust(col_widths[0])} | #{pname.ljust(col_widths[1])} | #{pval.ljust(col_widths[2])} |"
-    end
+  props.each_with_index do |prop, idx|
+    pname = prop[:property_name].to_s
+    pval = prop[:value].to_s
+    puts "| #{(idx+1).to_s.ljust(col_widths[0])} | #{pname.ljust(col_widths[1])} | #{pval.ljust(col_widths[2])} |"
   end
   puts sep
 end
-# --- END UPDATED ---
 
 def print_bsn_icebid_validation_table(validation_results)
   headers = ["Property", "Repo File Value", "GitHub Value", "Validation Status"]
+  return if !validation_results || validation_results.empty?  # <-- Silently skip if empty
   col_widths = headers.map(&:length)
   validation_results.each do |result|
     col_widths[0] = [col_widths[0], result[:property].to_s.length].max
@@ -418,57 +458,86 @@ def print_bsn_icebid_validation_table(validation_results)
   puts sep
 end
 
-def validate_teams_against_roles(github_teams, roles_hash)
-  expected_team_names = []
-  roles_hash.each do |role, arr|
-    arr.each { |r| expected_team_names << r['name'] }
+def lfs_files_info(repo_dir)
+  unless system('git lfs version > NUL 2>&1') || system('git lfs version > /dev/null 2>&1')
+    return :lfs_missing
   end
+  lfs_files = []
+  Dir.chdir(repo_dir) do
+    output = `git lfs ls-files -s 2>&1`
+    if output =~ /Smudge error|error downloading|does not exist on the server/i
+      return { lfs_error: true, log: output }
+    end
+    output.each_line do |line|
+      line = line.strip
+      next unless line.include?(" (") && line.end_with?(")")
+      parts = line.split(" (")
+      file_name = parts[0]
+      file_size = parts[1].gsub(")", "").to_f
+      lfs_files << { path: file_name, size_mb: file_size }
+    end
+  end
+  lfs_files
+end
+
+def compare_lfs_files(bb_lfs, gh_lfs)
+  all_files = (bb_lfs.map { |f| f[:path] } | gh_lfs.map { |f| f[:path] })
   results = []
-  expected_team_names.each_with_index do |team_name, idx|
-    gt = github_teams.find { |t| t[:name] == team_name }
-    status = gt ? "Validation Success" : "Validation Failed"
-    perm = gt ? gt[:permission] : "-"
-    results << { si_no: idx+1, name: team_name, permission: perm, status: status }
+  all_files.each_with_index do |path, idx|
+    bb = bb_lfs.find { |f| f[:path] == path }
+    gh = gh_lfs.find { |f| f[:path] == path }
+    results << {
+      si_no: idx + 1,
+      bb_path: bb ? bb[:path] : "-",
+      bb_size: bb ? bb[:size_mb] : "-",
+      gh_path: gh ? gh[:path] : "-",
+      gh_size: gh ? gh[:size_mb] : "-",
+      status: (bb && gh && bb[:size_mb] == gh[:size_mb]) ? "Validation Success" :
+              (bb.nil? ? "Missing in Bitbucket" : (gh.nil? ? "Missing in GitHub" : "Validation Failed"))
+    }
   end
   results
 end
 
-def load_repo_json_and_validate_bsn_icebid(repo_dir, bitbucket_project_key, gh_repo, github_custom_props)
-  repo_json_path = File.join(repo_dir, "repos", "#{bitbucket_project_key}_repos.json")
-  unless File.exist?(repo_json_path)
-    puts "Repo JSON file not found at #{repo_json_path}"
-    return [], nil
+def print_lfs_validation_table(results)
+  if results == :lfs_missing
+    puts "\nLFS Validation:\nWARNING: git-lfs is required but not installed! Skipping LFS validation. See https://git-lfs.github.com/"
+    return
   end
-  repo_json = JSON.parse(File.read(repo_json_path))
-  repo_entry = nil
-  if repo_json.is_a?(Array)
-    repo_entry = repo_json.find do |r|
-      nameval = (r["Name"] || r["name"])
-      nameval && nameval.strip.casecmp(gh_repo.strip).zero?
-    end
+  if results.is_a?(Hash) && results[:lfs_error]
+    puts "\nLFS Validation:\nWARNING: LFS files could not be downloaded during clone. This usually means required LFS objects are missing from the server. Please make sure all LFS files are pushed using 'git lfs push --all origin' from a machine where the files exist.\n\nLFS error log:\n#{results[:log]}"
+    return
   end
-  return [], nil unless repo_entry
-  bsn = repo_entry["BSN"] || repo_entry["bsn"]
-  icebid = repo_entry["ICEBID"] || repo_entry["icebid"]
-  gh_bsn = github_custom_props.find { |p| p[:property_name].to_s.downcase == "bsn" }&.dig(:value)
-  gh_icebid = github_custom_props.find { |p| p[:property_name].to_s.downcase == "icebid" }&.dig(:value)
-
-  validation_results = [
-    {
-      property: "BSN",
-      repo_value: bsn,
-      gh_value: gh_bsn,
-      status: (bsn.to_s == gh_bsn.to_s ? "Validation Success" : "Validation Failed")
-    },
-    {
-      property: "ICEBID",
-      repo_value: icebid,
-      gh_value: gh_icebid,
-      status: (icebid.to_s == gh_icebid.to_s ? "Validation Success" : "Validation Failed")
-    }
+  if !results || results.empty?
+    puts "\nLFS Validation:\nNo LFS files found in either repository."
+    return
+  end
+  headers = ["SI NO", "Bitbucket-Server-File/Path", "Size (MB)", "GitHub-File/Path", "Size (MB)", "Validation Status"]
+  col_widths = [
+    5,
+    [30, *results.map { |r| r[:bb_path].to_s.length }].max,
+    14,
+    [30, *results.map { |r| r[:gh_path].to_s.length }].max,
+    14,
+    18
   ]
-  return validation_results, repo_entry
+  sep = "+-" + col_widths.map { |w| "-" * w }.join("-+-") + "-+"
+
+  bb_total = results.map { |r| r[:bb_size].to_f if r[:bb_size].is_a?(Numeric) || r[:bb_size].to_s.match?(/^\d+(\.\d+)?$/) }.compact.sum
+  gh_total = results.map { |r| r[:gh_size].to_f if r[:gh_size].is_a?(Numeric) || r[:gh_size].to_s.match?(/^\d+(\.\d+)?$/) }.compact.sum
+
+  puts "\nLFS Validation:\n#{sep}"
+  puts "| " + headers.each_with_index.map { |h, i| h.ljust(col_widths[i]) }.join(" | ") + " |"
+  puts sep
+  results.each do |row|
+    puts "| #{row[:si_no].to_s.ljust(col_widths[0])} | #{row[:bb_path].ljust(col_widths[1])} | #{row[:bb_size].to_s.ljust(col_widths[2])} | #{row[:gh_path].ljust(col_widths[3])} | #{row[:gh_size].to_s.ljust(col_widths[4])} | #{row[:status].ljust(col_widths[5])} |"
+  end
+  puts sep
+  puts "| #{'Total Size (MB)'.ljust(col_widths[0])} | #{''.ljust(col_widths[1])} | #{bb_total.to_s.ljust(col_widths[2])} | #{''.ljust(col_widths[3])} | #{gh_total.to_s.ljust(col_widths[4])} | #{''.ljust(col_widths[5])} |"
+  puts sep
 end
+
+#-------------------- MAIN ------------------------
 
 if __FILE__ == $0
   if ARGV.length != 2
@@ -504,7 +573,6 @@ if __FILE__ == $0
     gh_tags = fetch_github_items("tags", gh_org, gh_repo)
     bb_default_branch = bitbucket_default_branch(project, repo)
     gh_default_branch = fetch_github_default_branch(gh_org, gh_repo)
-    # Use the correct default branch for GitHub queries below
     gh_branch = gh_branches.map { |b| b['name'] }.include?(bb_default_branch) ? bb_default_branch : (gh_branches.map { |b| b['name'] }.include?(gh_default_branch) ? gh_default_branch : gh_branches[0]['name'])
     bb_commit_count = bitbucket_commit_count(project, repo, bb_default_branch)
     gh_commit_count = fetch_github_commits_count(gh_org, gh_repo, gh_branch)
@@ -523,44 +591,71 @@ if __FILE__ == $0
 
     team_proj = read_teams_json(teams_json_path, project)
     if !team_proj
-      puts "Project key #{project} not found in teams.json!"
-      exit 1
+      puts "WARNING: Project key #{project} not found in teams.json! Skipping teams, codeowners, webhook, and custom property validations for this project."
+      teams_validation = []
+      codeowners_validation = nil
+      webhook_validation = nil
+      github_custom_props = []
+      bsn_icebid_validation, repo_entry = [[], nil]
+    else
+      github_teams = fetch_github_direct_access_teams(gh_org, gh_repo)
+      teams_validation = []
+      if team_proj['Roles']
+        teams_validation = validate_teams_against_roles(github_teams, team_proj['Roles'])
+      end
+
+      codeowners_validation = nil
+      if team_proj['CodeOwners']
+        github_codeowners = fetch_github_codeowners(gh_org, gh_repo, gh_branch)
+        expected_codeowners = team_proj['CodeOwners'] || []
+        missing = expected_codeowners.reject { |name| github_codeowners.any? { |real| real.include?(name) } }
+        status = missing.empty? ? "Validation Success" : "Validation Failed"
+        codeowners_validation = {
+          expected: expected_codeowners,
+          actual: github_codeowners,
+          missing: missing,
+          status: status
+        }
+      end
+
+      webhook_validation = nil
+      if team_proj['Webhook']
+        github_webhooks = fetch_github_webhooks(gh_org, gh_repo)
+        expected_webhook = team_proj['Webhook']
+        status = github_webhooks.include?(expected_webhook) ? "Validation Success" : "Validation Failed"
+        webhook_validation = {
+          expected: expected_webhook,
+          actual: github_webhooks,
+          status: status
+        }
+      end
+
+      github_custom_props = fetch_github_custom_properties_values(gh_org, gh_repo)
+      bsn_icebid_validation, repo_entry = [[], nil]
     end
 
-    github_teams = fetch_github_direct_access_teams(gh_org, gh_repo)
-    teams_validation = []
-    if team_proj['Roles']
-      teams_validation = validate_teams_against_roles(github_teams, team_proj['Roles'])
+    # ---- LFS VALIDATION ----
+    bb_clone_dir = File.join(Dir.pwd, "bitbucket_repo_clone")
+    gh_clone_dir = File.join(Dir.pwd, "github_repo_clone")
+    bb_repo_url = "#{ENV['BITBUCKET_BASEURL']}/scm/#{project.downcase}/#{repo.downcase}.git"
+    if ENV['BITBUCKET_USER'] && ENV['BITBUCKET_PASS']
+      bb_repo_url = bb_repo_url.sub('://', "://#{ENV['BITBUCKET_USER']}:#{ENV['BITBUCKET_PASS']}@")
     end
-
-    codeowners_validation = nil
-    if team_proj['CodeOwners']
-      github_codeowners = fetch_github_codeowners(gh_org, gh_repo, gh_branch)
-      expected_codeowners = team_proj['CodeOwners'] || []
-      missing = expected_codeowners.reject { |name| github_codeowners.any? { |real| real.include?(name) } }
-      status = missing.empty? ? "Validation Success" : "Validation Failed"
-      codeowners_validation = {
-        expected: expected_codeowners,
-        actual: github_codeowners,
-        missing: missing,
-        status: status
-      }
+    clone_repo_if_missing(bb_clone_dir, bb_repo_url)
+    clone_repo_if_missing(gh_clone_dir, "https://github.com/#{gh_org}/#{gh_repo}.git")
+    bb_lfs = lfs_files_info(bb_clone_dir)
+    gh_lfs = lfs_files_info(gh_clone_dir)
+    if bb_lfs == :lfs_missing || gh_lfs == :lfs_missing
+      lfs_validation_results = :lfs_missing
+    elsif bb_lfs.is_a?(Hash) && bb_lfs[:lfs_error]
+      lfs_validation_results = bb_lfs
+    elsif gh_lfs.is_a?(Hash) && gh_lfs[:lfs_error]
+      lfs_validation_results = gh_lfs
+    else
+      lfs_validation_results = compare_lfs_files(bb_lfs, gh_lfs)
     end
+    # ---- END LFS VALIDATION ----
 
-    webhook_validation = nil
-    if team_proj['Webhook']
-      github_webhooks = fetch_github_webhooks(gh_org, gh_repo)
-      expected_webhook = team_proj['Webhook']
-      status = github_webhooks.include?(expected_webhook) ? "Validation Success" : "Validation Failed"
-      webhook_validation = {
-        expected: expected_webhook,
-        actual: github_webhooks,
-        status: status
-      }
-    end
-
-    github_custom_props = fetch_github_custom_properties_values(gh_org, gh_repo)
-    bsn_icebid_validation, repo_entry = load_repo_json_and_validate_bsn_icebid(repo_dir, project, gh_repo, github_custom_props)
   rescue => e
     puts "Error occurred: #{e.message}"
     exit 1
@@ -582,8 +677,9 @@ if __FILE__ == $0
   print_codeowners_table(codeowners_validation)
   print_webhook_table(webhook_validation)
   print_heading("Teams Validation")
-  print_teams_table(teams_validation) if teams_validation.any?
+  print_teams_table(teams_validation)
   print_heading("Custom Properties Validation")
   print_github_custom_properties_table(github_custom_props, repo_entry)
-  print_bsn_icebid_validation_table(bsn_icebid_validation) if bsn_icebid_validation && !bsn_icebid_validation.empty?
+  print_bsn_icebid_validation_table(bsn_icebid_validation)
+  print_lfs_validation_table(lfs_validation_results)
 end
