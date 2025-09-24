@@ -29,6 +29,23 @@ def get_issue_number_and_repo
   [ENV['GITHUB_REPOSITORY'], nil]
 end
 
+def safe(val)
+  (val.nil? || val.to_s.strip.empty?) ? "-" : val
+end
+
+def github_api_request_with_rate_limit(req, uri)
+  res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
+  if res.code == "403" && res['X-RateLimit-Remaining'] == "0"
+    reset_time = res['X-RateLimit-Reset'].to_i
+    now = Time.now.to_i
+    wait = [reset_time - now, 1].max
+    puts "Rate limit exceeded, sleeping for #{wait} seconds..."
+    sleep(wait)
+    res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
+  end
+  res
+end
+
 issue_body = get_issue_body
 
 bb_project_key = extract_var(issue_body, 'bitbucket-source-project-key')
@@ -80,8 +97,7 @@ def github_api_get_raw(url)
   req = Net::HTTP::Get.new(uri)
   req['Authorization'] = "token #{ENV['GH_TOKEN']}" if ENV['GH_TOKEN']
   req['Accept'] = "application/vnd.github+json"
-  res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
-  res
+  github_api_request_with_rate_limit(req, uri)
 end
 
 def fetch_github_codeowners(org, repo, branch)
@@ -122,7 +138,7 @@ def fetch_github_direct_access_teams(org, repo, gh_token)
   loop do
     url = URI("https://api.github.com/repos/#{org}/#{repo}/teams?per_page=#{per_page}&page=#{page}")
     req = Net::HTTP::Get.new(url, headers)
-    res = Net::HTTP.start(url.hostname, url.port, use_ssl: true) { |http| http.request(req) }
+    res = github_api_request_with_rate_limit(req, url)
     data = JSON.parse(res.body)
     break if data.empty?
     data.each do |team|
@@ -150,7 +166,6 @@ def extract_expected_teams_roles(roles_hash)
   expected
 end
 
-# FIXED: Accept both 'admin' and 'maintain' as valid for owner role
 def validate_teams_json_vs_github(expected_teams, github_teams)
   results = []
   expected_teams.each_with_index do |et, idx|
@@ -159,14 +174,14 @@ def validate_teams_json_vs_github(expected_teams, github_teams)
     status = "Validation Failed"
     if gt
       if et[:permission] == "admin"
-        status = (perm == "admin" || perm == "maintain" || perm == "Repo-Owner") ? "Validation Success" : "Validation Failed"
+        status = ["admin", "maintain", "Repo-Owner"].include?(perm) ? "Validation Success" : "Validation Failed"
       else
         status = (et[:permission] == perm) ? "Validation Success" : "Validation Failed"
       end
     else
       status = "Team not in GitHub"
     end
-    results << { si_no: idx+1, name: et[:name], permission: et[:permission], status: status }
+    results << { si_no: safe(idx+1), name: safe(et[:name]), permission: safe(et[:permission]), status: safe(status) }
   end
   results
 end
@@ -179,12 +194,12 @@ def fetch_github_custom_properties_values(org, repo)
     if properties.is_a?(Array) && !properties.empty?
       properties.map do |item|
         {
-          property_name: item["property_name"] || item["name"] || item.keys.first,
-          value: item["value"] || item.values.last
+          property_name: safe(item["property_name"] || item["name"] || item.keys.first),
+          value: safe(item["value"] || item.values.last)
         }
       end
     elsif properties.is_a?(Hash) && !properties.empty?
-      properties.map { |k, v| { property_name: k, value: v } }
+      properties.map { |k, v| { property_name: safe(k), value: safe(v) } }
     else
       []
     end
@@ -196,7 +211,6 @@ end
 def clone_repo_if_missing(local_dir, remote_url, token=nil)
   FileUtils.rm_rf(local_dir) if Dir.exist?(local_dir)
   puts "Cloning #{remote_url} into #{local_dir} ..."
-  # Use HTTPS token authentication if available
   if token && !remote_url.include?("#{token}@")
     uri = URI.parse(remote_url)
     remote_url = "https://#{token}@#{uri.host}#{uri.path}"
@@ -232,7 +246,7 @@ def markdown_codeowners_table(codeowners_result)
 
 | Expected | Actual | Missing | Validation Status |
 |----------|--------|---------|------------------|
-| #{codeowners_result[:expected].join(', ')} | #{codeowners_result[:actual].join(', ')} | #{codeowners_result[:missing].join(', ')} | #{codeowners_result[:status]} |
+| #{safe(codeowners_result[:expected].join(', '))} | #{safe(codeowners_result[:actual].join(', '))} | #{safe(codeowners_result[:missing].join(', '))} | #{safe(codeowners_result[:status])} |
 
   MD
 end
@@ -241,43 +255,59 @@ metrics = []
 bb_branch = bitbucket_api("projects/#{bb_project_key}/repos/#{bb_repo_slug}/branches/default", bb_server_url, bb_user, bb_password, bb_token)["displayId"] rescue nil
 gh_repo_obj = client.repository("#{gh_org}/#{gh_repo}") rescue nil
 gh_branch = gh_repo_obj ? gh_repo_obj.default_branch : nil
-metrics << ["Default Branch Name", bb_branch, gh_branch, bb_branch == gh_branch ? "Validation Success" : "Validation Failed"]
+metrics << ["Default Branch Name", safe(bb_branch), safe(gh_branch), safe(bb_branch == gh_branch ? "Validation Success" : "Validation Failed")]
 
 bb_commit_count = bb_branch ? bitbucket_commit_count(bb_project_key, bb_repo_slug, bb_server_url, bb_user, bb_password, bb_token, bb_branch) : 0
 gh_commits = gh_branch ? client.commits("#{gh_org}/#{gh_repo}", gh_branch) : []
 gh_commit_count = gh_commits.count
-metrics << ["Total Commits in Default Br.", bb_commit_count, gh_commit_count, bb_commit_count == gh_commit_count ? "Validation Success" : "Validation Failed"]
+metrics << ["Total Commits in Default Br.", safe(bb_commit_count), safe(gh_commit_count), safe(bb_commit_count == gh_commit_count ? "Validation Success" : "Validation Failed")]
 
 bb_commits_first_page = bitbucket_api("projects/#{bb_project_key}/repos/#{bb_repo_slug}/commits?limit=1&until=#{bb_branch}", bb_server_url, bb_user, bb_password, bb_token) rescue nil
 bb_last_commit = bb_commits_first_page && bb_commits_first_page["values"] ? bb_commits_first_page["values"].first : nil
-bb_last_date = bb_last_commit ? Time.at(bb_last_commit["authorTimestamp"]/1000).utc.strftime("%d %B %Y") : ""
-gh_last_commit = gh_commits.first
-gh_last_date = gh_last_commit ? gh_last_commit.commit.author.date.utc.strftime("%d %B %Y") : ""
-metrics << ["Last Commit Date", bb_last_date, gh_last_date, bb_last_date == gh_last_date ? "Validation Success" : "Validation Failed"]
+bb_last_date = bb_last_commit ? Time.at(bb_last_commit["authorTimestamp"]/1000).utc.strftime("%d %B %Y") : "-"
+gh_last_commit = gh_commits.first rescue nil
+gh_last_date = gh_last_commit ? gh_last_commit.commit.author.date.utc.strftime("%d %B %Y") : "-"
+metrics << ["Last Commit Date", safe(bb_last_date), safe(gh_last_date), safe(bb_last_date == gh_last_date ? "Validation Success" : "Validation Failed")]
 
-bb_author = bb_last_commit && bb_last_commit["author"] ? bb_last_commit["author"]["name"] : ""
-gh_author = gh_last_commit && gh_last_commit.author ? gh_last_commit.author.login : "[bot]"
-metrics << ["Last Commit Author", bb_author, gh_author, bb_author == gh_author ? "Validation Success" : "Validation Failed"]
+bb_author = bb_last_commit && bb_last_commit["author"] ? bb_last_commit["author"]["name"] : "-"
 
-bb_sha = bb_last_commit ? bb_last_commit["id"][0..6] : ""
-gh_sha = gh_last_commit ? gh_last_commit.sha[0..6] : ""
-metrics << ["Last Commit SHA", bb_sha, gh_sha, bb_sha == gh_sha ? "Validation Success" : "Validation Failed"]
+# Github author logic: If it's a bot, print as a bot, otherwise print value, if missing print "-"
+gh_author = "-"
+if gh_last_commit
+  # If .author.login exists, use it
+  login = nil
+  if gh_last_commit.author && gh_last_commit.author.login
+    login = gh_last_commit.author.login
+  elsif gh_last_commit.commit && gh_last_commit.commit.author && gh_last_commit.commit.author.name
+    login = gh_last_commit.commit.author.name
+  end
+  gh_author = safe(login)
+  if !gh_author.eql?("-") && gh_author.downcase.include?("bot")
+    gh_author = "#{gh_author} (bot)"
+  end
+end
+
+metrics << ["Last Commit Author", safe(bb_author), safe(gh_author), safe(bb_author == gh_author ? "Validation Success" : "Validation Failed")]
+
+bb_sha = bb_last_commit ? bb_last_commit["id"][0..6] : "-"
+gh_sha = gh_last_commit ? gh_last_commit.sha[0..6] : "-"
+metrics << ["Last Commit SHA", safe(bb_sha), safe(gh_sha), safe(bb_sha == gh_sha ? "Validation Success" : "Validation Failed")]
 
 bb_prs = bitbucket_api("projects/#{bb_project_key}/repos/#{bb_repo_slug}/pull-requests?state=OPEN", bb_server_url, bb_user, bb_password, bb_token) rescue nil
 gh_prs = client.pull_requests("#{gh_org}/#{gh_repo}", state: 'open') rescue []
-metrics << ["Open PRs", bb_prs ? bb_prs["size"] : 0, gh_prs.count, (bb_prs ? bb_prs["size"] : 0) == gh_prs.count ? "Validation Success" : "Validation Failed"]
+metrics << ["Open PRs", safe(bb_prs ? bb_prs["size"] : 0), safe(gh_prs.count), safe((bb_prs ? bb_prs["size"] : 0) == gh_prs.count ? "Validation Success" : "Validation Failed")]
 
 bb_closed_prs = bitbucket_api("projects/#{bb_project_key}/repos/#{bb_repo_slug}/pull-requests?state=MERGED", bb_server_url, bb_user, bb_password, bb_token) rescue nil
 gh_closed_prs = client.pull_requests("#{gh_org}/#{gh_repo}", state: 'closed') rescue []
-metrics << ["Closed PRs", bb_closed_prs ? bb_closed_prs["size"] : 0, gh_closed_prs.count, (bb_closed_prs ? bb_closed_prs["size"] : 0) == gh_closed_prs.count ? "Validation Success" : "Validation Failed"]
+metrics << ["Closed PRs", safe(bb_closed_prs ? bb_closed_prs["size"] : 0), safe(gh_closed_prs.count), safe((bb_closed_prs ? bb_closed_prs["size"] : 0) == gh_closed_prs.count ? "Validation Success" : "Validation Failed")]
 
 bb_branches = bitbucket_api("projects/#{bb_project_key}/repos/#{bb_repo_slug}/branches", bb_server_url, bb_user, bb_password, bb_token) rescue nil
 gh_branches = client.branches("#{gh_org}/#{gh_repo}") rescue []
-metrics << ["Total Branches", bb_branches ? bb_branches["size"] : 0, gh_branches.count, (bb_branches ? bb_branches["size"] : 0) == gh_branches.count ? "Validation Success" : "Validation Failed"]
+metrics << ["Total Branches", safe(bb_branches ? bb_branches["size"] : 0), safe(gh_branches.count), safe((bb_branches ? bb_branches["size"] : 0) == gh_branches.count ? "Validation Success" : "Validation Failed")]
 
 bb_tags = bitbucket_api("projects/#{bb_project_key}/repos/#{bb_repo_slug}/tags", bb_server_url, bb_user, bb_password, bb_token) rescue nil
 gh_tags = client.tags("#{gh_org}/#{gh_repo}") rescue []
-metrics << ["Total Tags", bb_tags ? bb_tags["size"] : 0, gh_tags.count, (bb_tags ? bb_tags["size"] : 0) == gh_tags.count ? "Validation Success" : "Validation Failed"]
+metrics << ["Total Tags", safe(bb_tags ? bb_tags["size"] : 0), safe(gh_tags.count), safe((bb_tags ? bb_tags["size"] : 0) == gh_tags.count ? "Validation Success" : "Validation Failed")]
 
 teams_repo_url = "https://github.com/icesdlc/ghec.intcx.teams.git"
 teams_json_path = "teams/teams.json"
@@ -295,13 +325,13 @@ end
 roles_hash = team_proj && team_proj['Roles'] ? team_proj['Roles'] : {}
 expected_teams = extract_expected_teams_roles(roles_hash)
 expected_codeowners = team_proj && team_proj["CodeOwners"] ? team_proj["CodeOwners"].map { |n| "@#{n}" } : []
-expected_webhook = team_proj && team_proj["Webhook"] ? team_proj["Webhook"] : ""
+expected_webhook = team_proj && team_proj["Webhook"] ? team_proj["Webhook"] : "-"
 
 github_teams = fetch_github_direct_access_teams(gh_org, gh_repo, gh_token)
 actual_webhooks = []
 begin
   repo_hooks = client.hooks("#{gh_org}/#{gh_repo}")
-  actual_webhooks = repo_hooks.map { |h| h[:config][:url] }
+  actual_webhooks = repo_hooks.map { |h| safe(h[:config][:url]) }
 rescue => e
   puts "Error fetching repo webhook: #{e}"
 end
@@ -321,7 +351,7 @@ if team_proj && team_proj['CodeOwners']
 end
 
 teams_validation = validate_teams_json_vs_github(expected_teams, github_teams)
-webhook_status = actual_webhooks.include?(expected_webhook) ? "Validation Success" : "Validation Failed"
+webhook_status = actual_webhooks.include?(safe(expected_webhook)) ? "Validation Success" : "Validation Failed"
 github_custom_properties = fetch_github_custom_properties_values(gh_org, gh_repo)
 
 report_md = []
@@ -329,7 +359,7 @@ report_md << "\n**Repository Validation Metrics:**\n"
 report_md << "| Metric | Bitbucket Server | GitHub Cloud | Validation Status |"
 report_md << "|--------|------------------|--------------|-------------------|"
 metrics.each do |row|
-  report_md << "| #{row[0]} | #{row[1]} | #{row[2]} | #{row[3]} |"
+  report_md << "| #{safe(row[0])} | #{safe(row[1])} | #{safe(row[2])} | #{safe(row[3])} |"
 end
 
 report_md << markdown_codeowners_table(codeowners_validation) if codeowners_validation
@@ -337,20 +367,20 @@ report_md << markdown_codeowners_table(codeowners_validation) if codeowners_vali
 report_md << "\n**Webhook Validation:**\n"
 report_md << "| Expected | Actual | Validation Status |"
 report_md << "|----------|--------|------------------|"
-report_md << "| #{expected_webhook} | #{actual_webhooks.join(', ')} | #{webhook_status} |"
+report_md << "| #{safe(expected_webhook)} | #{safe(actual_webhooks.join(', '))} | #{safe(webhook_status)} |"
 
 report_md << "\n**Teams Validation:**\n"
 report_md << "| SI No | Team Name | Permission | Validation Status |"
 report_md << "|-------|-----------|------------|------------------|"
 teams_validation.each do |row|
-  report_md << "| #{row[:si_no]} | #{row[:name]} | #{row[:permission]} | #{row[:status]} |"
+  report_md << "| #{safe(row[:si_no])} | #{safe(row[:name])} | #{safe(row[:permission])} | #{safe(row[:status])} |"
 end
 
 report_md << "\n**GitHub Custom Properties Validation:**\n"
 report_md << "| SINO | Property-Name | Property-Value |"
 report_md << "|------|---------------|---------------|"
 github_custom_properties.each_with_index do |prop, idx|
-  report_md << "| #{idx+1} | #{prop[:property_name]} | #{prop[:value]} |"
+  report_md << "| #{safe(idx+1)} | #{safe(prop[:property_name])} | #{safe(prop[:value])} |"
 end
 
 comment_body = report_md.join("\n")
