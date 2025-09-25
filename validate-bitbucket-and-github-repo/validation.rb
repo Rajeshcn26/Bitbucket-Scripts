@@ -6,6 +6,29 @@ require 'open3'
 require 'fileutils'
 require 'base64'
 
+# -----------------
+# Shared Helper Methods
+# -----------------
+def safe(val)
+  (val.nil? || val.to_s.strip.empty?) ? "-" : val
+end
+
+def github_api_request_with_rate_limit(req, uri)
+  res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
+  if res.code == "403" && res['X-RateLimit-Remaining'] == "0"
+    reset_time = res['X-RateLimit-Reset'].to_i
+    now = Time.now.to_i
+    wait = [reset_time - now, 1].max
+    puts "Rate limit exceeded, sleeping for #{wait} seconds..."
+    sleep(wait)
+    res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
+  end
+  res
+end
+
+# -----------------
+# Repo/Issue Extraction
+# -----------------
 def extract_var(body, key)
   body[/#{key}:\s*([^\n]+)/, 1]
 end
@@ -29,39 +52,9 @@ def get_issue_number_and_repo
   [ENV['GITHUB_REPOSITORY'], nil]
 end
 
-def safe(val)
-  (val.nil? || val.to_s.strip.empty?) ? "-" : val
-end
-
-def github_api_request_with_rate_limit(req, uri)
-  res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
-  if res.code == "403" && res['X-RateLimit-Remaining'] == "0"
-    reset_time = res['X-RateLimit-Reset'].to_i
-    now = Time.now.to_i
-    wait = [reset_time - now, 1].max
-    puts "Rate limit exceeded, sleeping for #{wait} seconds..."
-    sleep(wait)
-    res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
-  end
-  res
-end
-
-issue_body = get_issue_body
-
-bb_project_key = extract_var(issue_body, 'bitbucket-source-project-key')
-bb_repo_slug   = extract_var(issue_body, 'bitbucket-source-repo-slug')
-bb_server_url  = ENV['BB_SERVER_URL'] || extract_var(issue_body, 'repo-url').sub(%r{/browse.*}, '')
-gh_org         = extract_var(issue_body, 'github-target-org')
-gh_repo        = extract_var(issue_body, 'github-target-repo-name')
-
-gh_token       = ENV['GH_TOKEN']
-bb_user        = ENV['BB_ACCT_USER']
-bb_password    = ENV['BB_ACCT_PASSWORD']
-bb_token       = ENV['BB_ACCT_TOKEN']
-
-client = Octokit::Client.new(access_token: gh_token)
-client.auto_paginate = true
-
+# -----------------
+# Bitbucket and GitHub API Wrappers
+# -----------------
 def bitbucket_api(path, bb_server_url, bb_user, bb_password, bb_token)
   uri = URI("#{bb_server_url}/rest/api/1.0/#{path}")
   req = Net::HTTP::Get.new(uri)
@@ -100,6 +93,9 @@ def github_api_get_raw(url)
   github_api_request_with_rate_limit(req, uri)
 end
 
+# -----------------
+# Teams/Codeowners/Custom Properties
+# -----------------
 def fetch_github_codeowners(org, repo, branch)
   urls = [
     "https://api.github.com/repos/#{org}/#{repo}/contents/.github/CODEOWNERS?ref=#{branch}",
@@ -251,6 +247,88 @@ def markdown_codeowners_table(codeowners_result)
   MD
 end
 
+# -----------------
+# LFS Validation
+# -----------------
+def lfs_files_and_shas_and_size(repo_path)
+  lfs_files = []
+  lfs_list = `cd #{repo_path} && git lfs ls-files`
+  lfs_list.split("\n").each do |line|
+    # Example line: SHA-256 * path/to/file.bin
+    if line =~ /^([0-9a-f]+)\s+\*\s+(.+)$/
+      sha = $1
+      file = $2
+      # Get file size in MB (if file exists locally)
+      size = "-"
+      file_path = File.join(repo_path, file)
+      if File.exist?(file_path)
+        size_bytes = File.size(file_path)
+        size = (size_bytes.to_f / (1024*1024)).round(1)
+      end
+      lfs_files << { sha: sha, path: file, size: size }
+    end
+  end
+  lfs_files
+end
+
+def lfs_validation_table(bb_repo_path, gh_repo_path)
+  bb_lfs = lfs_files_and_shas_and_size(bb_repo_path)
+  gh_lfs = lfs_files_and_shas_and_size(gh_repo_path)
+  all_files = (bb_lfs.map{|f| f[:path]} | gh_lfs.map{|f| f[:path]})
+  lfs_comparison = []
+  bb_total = 0.0
+  gh_total = 0.0
+
+  all_files.each_with_index do |file, idx|
+    bb_info = bb_lfs.find{ |f| f[:path] == file }
+    gh_info = gh_lfs.find{ |f| f[:path] == file }
+    bb_sha = bb_info ? bb_info[:sha] : "-"
+    bb_size = bb_info ? bb_info[:size] : "-"
+    gh_sha = gh_info ? gh_info[:sha] : "-"
+    gh_size = gh_info ? gh_info[:size] : "-"
+    status = (bb_sha == gh_sha && bb_size == gh_size) ? "Validation Success" : "Validation Failed"
+    lfs_comparison << [
+      safe(idx+1),
+      "#{safe(bb_sha)} * #{safe(file)}",
+      safe(bb_size),
+      "#{safe(gh_sha)} * #{safe(file)}",
+      safe(gh_size),
+      safe(status)
+    ]
+    bb_total += bb_size == "-" ? 0.0 : bb_size.to_f
+    gh_total += gh_size == "-" ? 0.0 : gh_size.to_f
+  end
+
+  md = []
+  md << "\n**LFS Validation:**\n"
+  md << "| SI NO | Bitbucket-Server-File/Path | Size (MB) | GitHub-File/Path | Size (MB) | Validation Status |"
+  md << "|-------|----------------------------|-----------|------------------|-----------|-------------------|"
+  lfs_comparison.each do |row|
+    md << "| #{row[0]} | #{row[1]} | #{row[2]} | #{row[3]} | #{row[4]} | #{row[5]} |"
+  end
+  md << "| Total Size (MB) | | #{safe(bb_total)} | | #{safe(gh_total)} | |"
+  md.join("\n")
+end
+
+# -----------------
+# Main Validation Script
+# -----------------
+issue_body = get_issue_body
+
+bb_project_key = extract_var(issue_body, 'bitbucket-source-project-key')
+bb_repo_slug   = extract_var(issue_body, 'bitbucket-source-repo-slug')
+bb_server_url  = ENV['BB_SERVER_URL'] || extract_var(issue_body, 'repo-url').sub(%r{/browse.*}, '')
+gh_org         = extract_var(issue_body, 'github-target-org')
+gh_repo        = extract_var(issue_body, 'github-target-repo-name')
+
+gh_token       = ENV['GH_TOKEN']
+bb_user        = ENV['BB_ACCT_USER']
+bb_password    = ENV['BB_ACCT_PASSWORD']
+bb_token       = ENV['BB_ACCT_TOKEN']
+
+client = Octokit::Client.new(access_token: gh_token)
+client.auto_paginate = true
+
 metrics = []
 bb_branch = bitbucket_api("projects/#{bb_project_key}/repos/#{bb_repo_slug}/branches/default", bb_server_url, bb_user, bb_password, bb_token)["displayId"] rescue nil
 gh_repo_obj = client.repository("#{gh_org}/#{gh_repo}") rescue nil
@@ -271,10 +349,8 @@ metrics << ["Last Commit Date", safe(bb_last_date), safe(gh_last_date), safe(bb_
 
 bb_author = bb_last_commit && bb_last_commit["author"] ? bb_last_commit["author"]["name"] : "-"
 
-# Github author logic: If it's a bot, print as a bot, otherwise print value, if missing print "-"
 gh_author = "-"
 if gh_last_commit
-  # If .author.login exists, use it
   login = nil
   if gh_last_commit.author && gh_last_commit.author.login
     login = gh_last_commit.author.login
@@ -382,6 +458,9 @@ report_md << "|------|---------------|---------------|"
 github_custom_properties.each_with_index do |prop, idx|
   report_md << "| #{safe(idx+1)} | #{safe(prop[:property_name])} | #{safe(prop[:value])} |"
 end
+
+# LFS Validation (assumes you have local clones for 'bb-repo' and 'gh-repo')
+report_md << lfs_validation_table('bb-repo', 'gh-repo')
 
 comment_body = report_md.join("\n")
 
