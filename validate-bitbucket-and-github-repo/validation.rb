@@ -6,9 +6,6 @@ require 'open3'
 require 'fileutils'
 require 'base64'
 
-# -----------------
-# Shared Helper Methods
-# -----------------
 def safe(val)
   (val.nil? || val.to_s.strip.empty?) ? "-" : val
 end
@@ -26,9 +23,6 @@ def github_api_request_with_rate_limit(req, uri)
   res
 end
 
-# -----------------
-# Repo/Issue Extraction
-# -----------------
 def extract_var(body, key)
   body[/#{key}:\s*([^\n]+)/, 1]
 end
@@ -52,9 +46,6 @@ def get_issue_number_and_repo
   [ENV['GITHUB_REPOSITORY'], nil]
 end
 
-# -----------------
-# Bitbucket and GitHub API Wrappers
-# -----------------
 def bitbucket_api(path, bb_server_url, bb_user, bb_password, bb_token)
   uri = URI("#{bb_server_url}/rest/api/1.0/#{path}")
   req = Net::HTTP::Get.new(uri)
@@ -85,6 +76,51 @@ def bitbucket_commit_count(bb_project_key, bb_repo_slug, bb_server_url, bb_user,
   count
 end
 
+def bitbucket_all_tags_count(bb_project_key, bb_repo_slug, bb_server_url, bb_user, bb_password, bb_token)
+  start = 0
+  limit = 100
+  count = 0
+  loop do
+    path = "projects/#{bb_project_key}/repos/#{bb_repo_slug}/tags?limit=#{limit}&start=#{start}"
+    resp = bitbucket_api(path, bb_server_url, bb_user, bb_password, bb_token) rescue {}
+    tags = resp['values'] || []
+    count += tags.size
+    break if resp['isLastPage'] || tags.empty?
+    start = resp['nextPageStart']
+  end
+  count
+end
+
+def bitbucket_all_branches_count(bb_project_key, bb_repo_slug, bb_server_url, bb_user, bb_password, bb_token)
+  start = 0
+  limit = 100
+  count = 0
+  loop do
+    path = "projects/#{bb_project_key}/repos/#{bb_repo_slug}/branches?limit=#{limit}&start=#{start}"
+    resp = bitbucket_api(path, bb_server_url, bb_user, bb_password, bb_token) rescue {}
+    branches = resp['values'] || []
+    count += branches.size
+    break if resp['isLastPage'] || branches.empty?
+    start = resp['nextPageStart']
+  end
+  count
+end
+
+def bitbucket_all_prs_count(bb_project_key, bb_repo_slug, bb_server_url, bb_user, bb_password, bb_token, state)
+  start = 0
+  limit = 100
+  count = 0
+  loop do
+    path = "projects/#{bb_project_key}/repos/#{bb_repo_slug}/pull-requests?state=#{state}&limit=#{limit}&start=#{start}"
+    resp = bitbucket_api(path, bb_server_url, bb_user, bb_password, bb_token) rescue {}
+    prs = resp['values'] || []
+    count += prs.size
+    break if resp['isLastPage'] || prs.empty?
+    start = resp['nextPageStart']
+  end
+  count
+end
+
 def github_api_get_raw(url)
   uri = URI(url)
   req = Net::HTTP::Get.new(uri)
@@ -93,9 +129,6 @@ def github_api_get_raw(url)
   github_api_request_with_rate_limit(req, uri)
 end
 
-# -----------------
-# Teams/Codeowners/Custom Properties
-# -----------------
 def fetch_github_codeowners(org, repo, branch)
   urls = [
     "https://api.github.com/repos/#{org}/#{repo}/contents/.github/CODEOWNERS?ref=#{branch}",
@@ -204,19 +237,32 @@ def fetch_github_custom_properties_values(org, repo)
   end
 end
 
-def clone_repo_if_missing(local_dir, remote_url, token=nil)
-  FileUtils.rm_rf(local_dir) if Dir.exist?(local_dir)
-  puts "Cloning #{remote_url} into #{local_dir} ..."
-  if token && !remote_url.include?("#{token}@")
-    uri = URI.parse(remote_url)
-    remote_url = "https://#{token}@#{uri.host}#{uri.path}"
+def clone_repo_if_missing(local_dir, remote_url, opts={})
+  return true if Dir.exist?(local_dir) # already exists
+  puts "Cloning into '#{local_dir}'..."
+
+  url = remote_url.dup
+  if opts[:type] == :bitbucket
+    if opts[:token] && !opts[:token].empty?
+      url = url.sub('https://', "https://x-token-auth:#{opts[:token]}@")
+    elsif opts[:user] && opts[:password]
+      url = url.sub('https://', "https://#{opts[:user]}:#{opts[:password]}@")
+    end
+  elsif opts[:type] == :github
+    if opts[:token] && !opts[:token].empty?
+      url = url.sub('https://', "https://#{opts[:token]}@")
+    end
   end
-  env = { "GIT_TERMINAL_PROMPT" => "0" }
-  system(env, "git clone --depth 1 #{remote_url} #{local_dir}")
+
+  url_safe = url.gsub(/(\/\/)(.*):(.*)@/, '\1****:****@')
+  puts "Cloning #{url_safe} ..."
+
+  system("git clone --depth 1 #{url} #{local_dir}")
   unless Dir.exist?(local_dir)
-    puts "Error: Unable to clone #{remote_url}! Skipping teams.json validation."
+    puts "Error: Unable to clone #{remote_url}!"
     return false
   end
+  system("cd #{local_dir} && git lfs pull")
   true
 end
 
@@ -247,18 +293,13 @@ def markdown_codeowners_table(codeowners_result)
   MD
 end
 
-# -----------------
-# LFS Validation
-# -----------------
 def lfs_files_and_shas_and_size(repo_path)
   lfs_files = []
   lfs_list = `cd #{repo_path} && git lfs ls-files`
   lfs_list.split("\n").each do |line|
-    # Example line: SHA-256 * path/to/file.bin
     if line =~ /^([0-9a-f]+)\s+\*\s+(.+)$/
       sha = $1
       file = $2
-      # Get file size in MB (if file exists locally)
       size = "-"
       file_path = File.join(repo_path, file)
       if File.exist?(file_path)
@@ -310,14 +351,16 @@ def lfs_validation_table(bb_repo_path, gh_repo_path)
   md.join("\n")
 end
 
-# -----------------
+# ====================
 # Main Validation Script
-# -----------------
+# ====================
 issue_body = get_issue_body
 
 bb_project_key = extract_var(issue_body, 'bitbucket-source-project-key')
 bb_repo_slug   = extract_var(issue_body, 'bitbucket-source-repo-slug')
-bb_server_url  = ENV['BB_SERVER_URL'] || extract_var(issue_body, 'repo-url').sub(%r{/browse.*}, '')
+
+repo_url_var = extract_var(issue_body, 'repo-url')
+bb_server_url  = ENV['BB_SERVER_URL'] || (repo_url_var ? repo_url_var.sub(%r{/browse.*}, '') : nil)
 gh_org         = extract_var(issue_body, 'github-target-org')
 gh_repo        = extract_var(issue_body, 'github-target-repo-name')
 
@@ -328,6 +371,21 @@ bb_token       = ENV['BB_ACCT_TOKEN']
 
 client = Octokit::Client.new(access_token: gh_token)
 client.auto_paginate = true
+
+# --- Compose Bitbucket and GitHub Clone URLs with credentials ---
+bitbucket_repo_url = extract_var(issue_body, 'bitbucket-source-http-url')
+github_repo_url = extract_var(issue_body, 'github-target-http-url')
+
+if !bitbucket_repo_url && bb_server_url && bb_project_key && bb_repo_slug
+  bitbucket_repo_url = "#{bb_server_url}/scm/#{bb_project_key.downcase}/#{bb_repo_slug.downcase}.git"
+end
+if !github_repo_url && gh_org && gh_repo
+  github_repo_url = "https://github.com/#{gh_org}/#{gh_repo}.git"
+end
+
+# --- Clone both repos with credentials ---
+clone_repo_if_missing('bb-repo', bitbucket_repo_url, type: :bitbucket, user: bb_user, password: bb_password, token: bb_token)
+clone_repo_if_missing('gh-repo', github_repo_url, type: :github, token: gh_token)
 
 metrics = []
 bb_branch = bitbucket_api("projects/#{bb_project_key}/repos/#{bb_repo_slug}/branches/default", bb_server_url, bb_user, bb_password, bb_token)["displayId"] rescue nil
@@ -369,30 +427,31 @@ bb_sha = bb_last_commit ? bb_last_commit["id"][0..6] : "-"
 gh_sha = gh_last_commit ? gh_last_commit.sha[0..6] : "-"
 metrics << ["Last Commit SHA", safe(bb_sha), safe(gh_sha), safe(bb_sha == gh_sha ? "Validation Success" : "Validation Failed")]
 
-bb_prs = bitbucket_api("projects/#{bb_project_key}/repos/#{bb_repo_slug}/pull-requests?state=OPEN", bb_server_url, bb_user, bb_password, bb_token) rescue nil
+# Paginated PRs
+bb_open_pr_count = bitbucket_all_prs_count(bb_project_key, bb_repo_slug, bb_server_url, bb_user, bb_password, bb_token, "OPEN")
 gh_prs = client.pull_requests("#{gh_org}/#{gh_repo}", state: 'open') rescue []
-metrics << ["Open PRs", safe(bb_prs ? bb_prs["size"] : 0), safe(gh_prs.count), safe((bb_prs ? bb_prs["size"] : 0) == gh_prs.count ? "Validation Success" : "Validation Failed")]
+metrics << ["Open PRs", safe(bb_open_pr_count), safe(gh_prs.count), safe(bb_open_pr_count == gh_prs.count ? "Validation Success" : "Validation Failed")]
 
-bb_closed_prs = bitbucket_api("projects/#{bb_project_key}/repos/#{bb_repo_slug}/pull-requests?state=MERGED", bb_server_url, bb_user, bb_password, bb_token) rescue nil
+bb_closed_pr_count = bitbucket_all_prs_count(bb_project_key, bb_repo_slug, bb_server_url, bb_user, bb_password, bb_token, "MERGED")
 gh_closed_prs = client.pull_requests("#{gh_org}/#{gh_repo}", state: 'closed') rescue []
-metrics << ["Closed PRs", safe(bb_closed_prs ? bb_closed_prs["size"] : 0), safe(gh_closed_prs.count), safe((bb_closed_prs ? bb_closed_prs["size"] : 0) == gh_closed_prs.count ? "Validation Success" : "Validation Failed")]
+metrics << ["Closed PRs", safe(bb_closed_pr_count), safe(gh_closed_prs.count), safe(bb_closed_pr_count == gh_closed_prs.count ? "Validation Success" : "Validation Failed")]
 
-bb_branches = bitbucket_api("projects/#{bb_project_key}/repos/#{bb_repo_slug}/branches", bb_server_url, bb_user, bb_password, bb_token) rescue nil
+bb_branches_count = bitbucket_all_branches_count(bb_project_key, bb_repo_slug, bb_server_url, bb_user, bb_password, bb_token)
 gh_branches = client.branches("#{gh_org}/#{gh_repo}") rescue []
-metrics << ["Total Branches", safe(bb_branches ? bb_branches["size"] : 0), safe(gh_branches.count), safe((bb_branches ? bb_branches["size"] : 0) == gh_branches.count ? "Validation Success" : "Validation Failed")]
+metrics << ["Total Branches", safe(bb_branches_count), safe(gh_branches.count), safe(bb_branches_count == gh_branches.count ? "Validation Success" : "Validation Failed")]
 
-bb_tags = bitbucket_api("projects/#{bb_project_key}/repos/#{bb_repo_slug}/tags", bb_server_url, bb_user, bb_password, bb_token) rescue nil
+bb_tags_count = bitbucket_all_tags_count(bb_project_key, bb_repo_slug, bb_server_url, bb_user, bb_password, bb_token)
 gh_tags = client.tags("#{gh_org}/#{gh_repo}") rescue []
-metrics << ["Total Tags", safe(bb_tags ? bb_tags["size"] : 0), safe(gh_tags.count), safe((bb_tags ? bb_tags["size"] : 0) == gh_tags.count ? "Validation Success" : "Validation Failed")]
+metrics << ["Total Tags", safe(bb_tags_count), safe(gh_tags.count), safe(bb_tags_count == gh_tags.count ? "Validation Success" : "Validation Failed")]
 
 teams_repo_url = "https://github.com/icesdlc/ghec.intcx.teams.git"
 teams_json_path = "teams/teams.json"
 work_dir = "tmp_teamsrepo_#{Time.now.to_i}"
 
-teams_json_cloned = clone_repo_if_missing(work_dir, teams_repo_url, gh_token)
+clone_repo_if_missing(work_dir, teams_repo_url, type: :github, token: gh_token)
 teams_json_file = File.join(work_dir, teams_json_path)
 team_proj = nil
-if teams_json_cloned && File.exist?(teams_json_file)
+if File.exist?(teams_json_file)
   team_proj = read_teams_json(teams_json_file, bb_project_key)
 else
   puts "teams.json does not exist in cloned repo or clone failed"
@@ -459,7 +518,6 @@ github_custom_properties.each_with_index do |prop, idx|
   report_md << "| #{safe(idx+1)} | #{safe(prop[:property_name])} | #{safe(prop[:value])} |"
 end
 
-# LFS Validation (assumes you have local clones for 'bb-repo' and 'gh-repo')
 report_md << lfs_validation_table('bb-repo', 'gh-repo')
 
 comment_body = report_md.join("\n")
