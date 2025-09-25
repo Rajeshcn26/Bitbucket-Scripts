@@ -10,6 +10,20 @@ def safe(val)
   (val.nil? || val.to_s.strip.empty?) ? "-" : val
 end
 
+def human_filesize(bytes)
+  return "-" if bytes.nil? || bytes == "-"
+  bytes = bytes.to_f
+  if bytes < 1024
+    "#{bytes.round(1)} B"
+  elsif bytes < 1024 * 1024
+    "#{(bytes / 1024).round(1)} KB"
+  elsif bytes < 1024 * 1024 * 1024
+    "#{(bytes / (1024 * 1024)).round(1)} MB"
+  else
+    "#{(bytes / (1024 * 1024 * 1024)).round(2)} GB"
+  end
+end
+
 def github_api_request_with_rate_limit(req, uri)
   res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
   if res.code == "403" && res['X-RateLimit-Remaining'] == "0"
@@ -300,13 +314,28 @@ def lfs_files_and_shas_and_size(repo_path)
     if line =~ /^([0-9a-f]+)\s+\*\s+(.+)$/
       sha = $1
       file = $2
-      size = "-"
+      size_str = "-"
       file_path = File.join(repo_path, file)
+      size_bytes = nil
       if File.exist?(file_path)
         size_bytes = File.size(file_path)
-        size = (size_bytes.to_f / (1024*1024)).round(1)
+        size_str = human_filesize(size_bytes)
+      else
+        # Try to parse the size from git lfs ls-files output when present, e.g. "sha * path (xxx MB)"
+        if line =~ /\(([\d.]+) ([A-Za-z]+)\)/
+          number = $1.to_f
+          unit = $2
+          size_bytes = case unit.upcase
+            when "B" then number
+            when "KB" then number * 1024
+            when "MB" then number * 1024 * 1024
+            when "GB" then number * 1024 * 1024 * 1024
+            else nil
+          end
+          size_str = human_filesize(size_bytes) if size_bytes
+        end
       end
-      lfs_files << { sha: sha, path: file, size: size }
+      lfs_files << { sha: sha, path: file, size_bytes: size_bytes, size: size_str }
     end
   end
   lfs_files
@@ -315,39 +344,43 @@ end
 def lfs_validation_table(bb_repo_path, gh_repo_path)
   bb_lfs = lfs_files_and_shas_and_size(bb_repo_path)
   gh_lfs = lfs_files_and_shas_and_size(gh_repo_path)
-  all_files = (bb_lfs.map{|f| f[:path]} | gh_lfs.map{|f| f[:path]})
+  all_files = (bb_lfs.map { |f| f[:path] } | gh_lfs.map { |f| f[:path] }).sort
   lfs_comparison = []
-  bb_total = 0.0
-  gh_total = 0.0
+  bb_total_bytes = 0
+  gh_total_bytes = 0
 
   all_files.each_with_index do |file, idx|
-    bb_info = bb_lfs.find{ |f| f[:path] == file }
-    gh_info = gh_lfs.find{ |f| f[:path] == file }
+    bb_info = bb_lfs.find { |f| f[:path] == file }
+    gh_info = gh_lfs.find { |f| f[:path] == file }
     bb_sha = bb_info ? bb_info[:sha] : "-"
     bb_size = bb_info ? bb_info[:size] : "-"
+    bb_bytes = bb_info ? (bb_info[:size_bytes] || 0) : 0
     gh_sha = gh_info ? gh_info[:sha] : "-"
     gh_size = gh_info ? gh_info[:size] : "-"
+    gh_bytes = gh_info ? (gh_info[:size_bytes] || 0) : 0
     status = (bb_sha == gh_sha && bb_size == gh_size) ? "Validation Success" : "Validation Failed"
     lfs_comparison << [
       safe(idx+1),
-      "#{safe(bb_sha)} * #{safe(file)}",
+      safe(file),
+      safe(bb_sha),
       safe(bb_size),
-      "#{safe(gh_sha)} * #{safe(file)}",
+      safe(gh_sha),
       safe(gh_size),
       safe(status)
     ]
-    bb_total += bb_size == "-" ? 0.0 : bb_size.to_f
-    gh_total += gh_size == "-" ? 0.0 : gh_size.to_f
+    bb_total_bytes += bb_bytes
+    gh_total_bytes += gh_bytes
   end
 
   md = []
   md << "\n**LFS Validation:**\n"
-  md << "| SI NO | Bitbucket-Server-File/Path | Size (MB) | GitHub-File/Path | Size (MB) | Validation Status |"
-  md << "|-------|----------------------------|-----------|------------------|-----------|-------------------|"
+  md << "| SI NO | File Path | Bitbucket SHA | Bitbucket Size | GitHub SHA | GitHub Size | Validation Status |"
+  md << "|-------|-----------|---------------|---------------|------------|-------------|-------------------|"
   lfs_comparison.each do |row|
-    md << "| #{row[0]} | #{row[1]} | #{row[2]} | #{row[3]} | #{row[4]} | #{row[5]} |"
+    md << "| #{row[0]} | #{row[1]} | #{row[2]} | #{row[3]} | #{row[4]} | #{row[5]} | #{row[6]} |"
   end
-  md << "| Total Size (MB) | | #{safe(bb_total)} | | #{safe(gh_total)} | |"
+  md << "| **Total Files** | #{all_files.size} | | **Total Size** | | #{human_filesize(gh_total_bytes)} | |"
+  md << "|  |  |  | #{human_filesize(bb_total_bytes)} |  | | |"
   md.join("\n")
 end
 
@@ -427,7 +460,6 @@ bb_sha = bb_last_commit ? bb_last_commit["id"][0..6] : "-"
 gh_sha = gh_last_commit ? gh_last_commit.sha[0..6] : "-"
 metrics << ["Last Commit SHA", safe(bb_sha), safe(gh_sha), safe(bb_sha == gh_sha ? "Validation Success" : "Validation Failed")]
 
-# Paginated PRs
 bb_open_pr_count = bitbucket_all_prs_count(bb_project_key, bb_repo_slug, bb_server_url, bb_user, bb_password, bb_token, "OPEN")
 gh_prs = client.pull_requests("#{gh_org}/#{gh_repo}", state: 'open') rescue []
 metrics << ["Open PRs", safe(bb_open_pr_count), safe(gh_prs.count), safe(bb_open_pr_count == gh_prs.count ? "Validation Success" : "Validation Failed")]
