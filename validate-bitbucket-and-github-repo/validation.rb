@@ -2,7 +2,6 @@ require 'octokit'
 require 'net/http'
 require 'json'
 require 'date'
-require 'open3'
 require 'fileutils'
 require 'base64'
 
@@ -69,7 +68,14 @@ def bitbucket_api(path, bb_server_url, bb_user, bb_password, bb_token)
     req.basic_auth(bb_user, bb_password)
   end
   res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") { |http| http.request(req) }
+  unless res.is_a?(Net::HTTPSuccess)
+    puts "Bitbucket API error for #{uri}: #{res.code} #{res.body}"
+    return {}
+  end
   JSON.parse(res.body)
+rescue => e
+  puts "Bitbucket API exception for #{uri}: #{e.message}"
+  {}
 end
 
 def bitbucket_commit_count(bb_project_key, bb_repo_slug, bb_server_url, bb_user, bb_password, bb_token, branch)
@@ -79,7 +85,7 @@ def bitbucket_commit_count(bb_project_key, bb_repo_slug, bb_server_url, bb_user,
   more = true
   while more
     path = "projects/#{bb_project_key}/repos/#{bb_repo_slug}/commits?limit=#{limit}&start=#{start}&until=#{branch}"
-    resp = bitbucket_api(path, bb_server_url, bb_user, bb_password, bb_token) rescue {}
+    resp = bitbucket_api(path, bb_server_url, bb_user, bb_password, bb_token)
     count += (resp['values'] ? resp['values'].size : 0)
     if resp['isLastPage'] || !resp['values'] || resp['values'].empty?
       more = false
@@ -96,7 +102,7 @@ def bitbucket_all_tags_count(bb_project_key, bb_repo_slug, bb_server_url, bb_use
   count = 0
   loop do
     path = "projects/#{bb_project_key}/repos/#{bb_repo_slug}/tags?limit=#{limit}&start=#{start}"
-    resp = bitbucket_api(path, bb_server_url, bb_user, bb_password, bb_token) rescue {}
+    resp = bitbucket_api(path, bb_server_url, bb_user, bb_password, bb_token)
     tags = resp['values'] || []
     count += tags.size
     break if resp['isLastPage'] || tags.empty?
@@ -111,7 +117,7 @@ def bitbucket_all_branches_count(bb_project_key, bb_repo_slug, bb_server_url, bb
   count = 0
   loop do
     path = "projects/#{bb_project_key}/repos/#{bb_repo_slug}/branches?limit=#{limit}&start=#{start}"
-    resp = bitbucket_api(path, bb_server_url, bb_user, bb_password, bb_token) rescue {}
+    resp = bitbucket_api(path, bb_server_url, bb_user, bb_password, bb_token)
     branches = resp['values'] || []
     count += branches.size
     break if resp['isLastPage'] || branches.empty?
@@ -126,7 +132,7 @@ def bitbucket_all_prs_count(bb_project_key, bb_repo_slug, bb_server_url, bb_user
   count = 0
   loop do
     path = "projects/#{bb_project_key}/repos/#{bb_repo_slug}/pull-requests?state=#{state}&limit=#{limit}&start=#{start}"
-    resp = bitbucket_api(path, bb_server_url, bb_user, bb_password, bb_token) rescue {}
+    resp = bitbucket_api(path, bb_server_url, bb_user, bb_password, bb_token)
     prs = resp['values'] || []
     count += prs.size
     break if resp['isLastPage'] || prs.empty?
@@ -307,35 +313,21 @@ def markdown_codeowners_table(codeowners_result)
   MD
 end
 
+# --- LFS robust validation: get tracked LFS files using git lfs and check pointer files ---
 def lfs_files_and_shas_and_size(repo_path)
-  lfs_files = []
-  lfs_list = `cd #{repo_path} && git lfs ls-files`
-  lfs_list.split("\n").each do |line|
-    if line =~ /^([0-9a-f]+)\s+\*\s+(.+)$/
-      sha = $1
-      file = $2
-      size_str = "-"
-      file_path = File.join(repo_path, file)
-      size_bytes = nil
-      if File.exist?(file_path)
-        size_bytes = File.size(file_path)
-        size_str = human_filesize(size_bytes)
-      else
-        # Try to parse the size from git lfs ls-files output when present, e.g. "sha * path (xxx MB)"
-        if line =~ /\(([\d.]+) ([A-Za-z]+)\)/
-          number = $1.to_f
-          unit = $2
-          size_bytes = case unit.upcase
-            when "B" then number
-            when "KB" then number * 1024
-            when "MB" then number * 1024 * 1024
-            when "GB" then number * 1024 * 1024 * 1024
-            else nil
-          end
-          size_str = human_filesize(size_bytes) if size_bytes
-        end
-      end
-      lfs_files << { sha: sha, path: file, size_bytes: size_bytes, size: size_str }
+  lfs_files = {}
+  Dir.chdir(repo_path) do
+    tracked = `git lfs ls-files --name-only`.lines.map(&:strip).uniq
+    tracked.each do |file|
+      pointer = `git lfs pointer --file="#{file}" 2>/dev/null`
+      sha = pointer[/oid sha256:([a-f0-9]+)/, 1]
+      size = pointer[/size ([0-9]+)/, 1]
+      lfs_files[file] = {
+        sha: sha || "-",
+        path: file,
+        size_bytes: size ? size.to_i : nil,
+        size: size ? human_filesize(size.to_i) : "-"
+      }
     end
   end
   lfs_files
@@ -344,21 +336,22 @@ end
 def lfs_validation_table(bb_repo_path, gh_repo_path)
   bb_lfs = lfs_files_and_shas_and_size(bb_repo_path)
   gh_lfs = lfs_files_and_shas_and_size(gh_repo_path)
-  all_files = (bb_lfs.map { |f| f[:path] } | gh_lfs.map { |f| f[:path] }).sort
+  all_files = (bb_lfs.keys + gh_lfs.keys).uniq.sort
   lfs_comparison = []
   bb_total_bytes = 0
   gh_total_bytes = 0
 
   all_files.each_with_index do |file, idx|
-    bb_info = bb_lfs.find { |f| f[:path] == file }
-    gh_info = gh_lfs.find { |f| f[:path] == file }
-    bb_sha = bb_info ? bb_info[:sha] : "-"
+    bb_info = bb_lfs[file]
+    gh_info = gh_lfs[file]
+    # Only first 7 chars of SHA for both
+    bb_sha = bb_info ? (bb_info[:sha] ? bb_info[:sha][0..6] : "-") : "-"
     bb_size = bb_info ? bb_info[:size] : "-"
     bb_bytes = bb_info ? (bb_info[:size_bytes] || 0) : 0
-    gh_sha = gh_info ? gh_info[:sha] : "-"
+    gh_sha = gh_info ? (gh_info[:sha] ? gh_info[:sha][0..6] : "-") : "-"
     gh_size = gh_info ? gh_info[:size] : "-"
     gh_bytes = gh_info ? (gh_info[:size_bytes] || 0) : 0
-    status = (bb_sha == gh_sha && bb_size == gh_size) ? "Validation Success" : "Validation Failed"
+    status = (bb_sha == gh_sha && bb_size == gh_size && bb_sha != "-") ? "Validation Success" : "Validation Failed"
     lfs_comparison << [
       safe(idx+1),
       safe(file),
@@ -567,3 +560,5 @@ else
 end
 
 FileUtils.rm_rf(work_dir)
+FileUtils.rm_rf('bb-repo') if Dir.exist?('bb-repo')
+FileUtils.rm_rf('gh-repo') if Dir.exist?('gh-repo')
